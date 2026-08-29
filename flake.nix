@@ -11,7 +11,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        buildInputs = with pkgs; [ clang clang-tools pkg-config raylib libopenmpt gf sdl3 ];
+        buildInputs = with pkgs; [ clang clang-tools pkg-config raylib libopenmpt gf sdl3 gitui ];
       in {
         devShells.default =
           pkgs.mkShell { inherit buildInputs; };
