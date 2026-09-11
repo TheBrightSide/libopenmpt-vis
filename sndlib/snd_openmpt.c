@@ -1,4 +1,5 @@
 #include "snd.h"
+#include "snd_ring_buffer.h"
 
 #include <libopenmpt/libopenmpt.h>
 #include <libopenmpt/libopenmpt_stream_callbacks_buffer.h>
@@ -9,81 +10,31 @@
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_mutex.h>
 
-#define SND_RING_CAP (1u << 10 /* 1024 */)
-#define SND_RING_MASK (SND_RING_CAP - 1)
-
 static int16_t SND_ZEROARRAY[1024] = {0};
 
-typedef struct sndRingBuffer {
-  sndNote data[SND_RING_CAP];
-  SDL_AtomicU32 write_idx; // producer-only
-  SDL_AtomicU32 read_idx;  // consumer-only
-} sndRingBuffer;
-
 struct sndContext {
-  sndRingBuffer event_buffer;
   SDL_AudioStream *stream;
-  SDL_AtomicU32 stream_written_samples;
   void *callback_buffer;
   size_t callback_buffer_cap;
   SDL_Mutex *mod_mutex;
   openmpt_module *mod;
   openmpt_stream_buffer2 mod_data;
+  SDL_AtomicU32 stream_written_samples;
   int32_t mod_last_order;
   int32_t mod_last_row;
   int32_t mod_channels;
   uint32_t audio_sample_rate;
+  sndRingBuffer event_buffer;
   uint8_t audio_channels;
   bool is_mod_data_file;
 };
 
-// NOTE: Producer -- only to be called from audio thread/callback (single
-//       producer)
-bool sndEventPush(sndContext *ctx, sndNote *event) {
-  uint32_t w = SDL_GetAtomicU32(&ctx->event_buffer.write_idx); // our own idx
-  uint32_t r = SDL_GetAtomicU32(&ctx->event_buffer.read_idx); // see freed slots
-  // Ensure we observe the consumer's completed reads of any slot we are about
-  // to reuse. Without this acquire, reusing a freed slot races with the
-  // consumer's earlier read of that same slot.
-  SDL_MemoryBarrierAcquire();
-  if (w - r == SND_RING_CAP)
-    return false;
-
-  ctx->event_buffer.data[w & SND_RING_MASK] = *event;    // 1. write
-  SDL_MemoryBarrierRelease();                            // 2. order
-  SDL_SetAtomicU32(&ctx->event_buffer.write_idx, w + 1); // 3. publish
-
-  return true;
+size_t sndEventPop(sndContext *ctx, sndNote* out, size_t cap) {
+  return sndRingBufferPop(&ctx->event_buffer, out, cap);
 }
 
-// NOTE: Consumer -- only to be called from user thread (e.g. renderer thread)
-//       (single consumer)
-size_t sndEventPop(sndContext *ctx, sndNote *out, size_t cap) {
-  uint32_t w =
-      SDL_GetAtomicU32(&ctx->event_buffer.write_idx); // see published slots
-  uint32_t r = SDL_GetAtomicU32(&ctx->event_buffer.read_idx); // our own idx
-
-  uint32_t avail = w - r;
-  if (avail == 0)
-    return 0;
-
-  SDL_MemoryBarrierAcquire(); // 1.1. order: see published data before reading
-                              // it
-  size_t n = (size_t)(avail < cap ? avail : cap);
-  for (uint32_t i = 0; i < n; i++) {
-    out[i] = ctx->event_buffer
-                 .data[(r + i) & SND_RING_MASK]; // 1.2.*. subsequent reads
-  }
-
-  SDL_MemoryBarrierRelease(); // 2.1. order: done copying before freeing the
-                              // slot
-  SDL_SetAtomicU32(&ctx->event_buffer.read_idx,
-                   r + (uint32_t)n); // 2.2. publish: mark free slots
-  return n;
-}
-
-size_t sndRenderChunk(sndContext *ctx, int16_t *dst, size_t n_frames) {
-  size_t rendered_frames = openmpt_module_read_interleaved_stereo(
+size_t sndRenderChunk(sndContext *ctx, float *dst, size_t n_frames) {
+  size_t rendered_frames = openmpt_module_read_interleaved_float_stereo(
       ctx->mod, ctx->audio_sample_rate, n_frames, dst);
 
   if (rendered_frames == 0)
@@ -116,7 +67,7 @@ size_t sndRenderChunk(sndContext *ctx, int16_t *dst, size_t n_frames) {
           .channel = channel,
           .audible_timestamp = playback_time,
       };
-      sndEventPush(ctx, &event);
+      sndRingBufferPush(&ctx->event_buffer, &event);
     }
   }
 
@@ -164,12 +115,13 @@ void sndSDLAudioProcess(void *userdata, SDL_AudioStream *stream,
   // from here on we hold the mutex.
   if (ctx->mod == NULL) {
     SDL_UnlockMutex(ctx->mod_mutex);
-    sndFeedSilence(stream, additional_amount);
+    SDL_PauseAudioStreamDevice(stream);
     return;
   }
 
-  const int bytes_per_frame = ctx->audio_channels * (int)sizeof(int16_t);
+  const int bytes_per_frame = ctx->audio_channels * (int)sizeof(float);
   int frames_needed = additional_amount / bytes_per_frame;
+  uint32_t total_frames_written = SDL_GetAtomicU32(&ctx->stream_written_samples);
 
   while (frames_needed > 0) {
     // slice by at most half a tracker tick so that each sndRenderChunk call
@@ -197,12 +149,14 @@ void sndSDLAudioProcess(void *userdata, SDL_AudioStream *stream,
       SDL_UnlockMutex(ctx->mod_mutex);
       return;
     }
-    SDL_AddAtomicU32(&ctx->stream_written_samples, got);
     SDL_PutAudioStreamData(stream, ctx->callback_buffer,
                            (int)(got * bytes_per_frame));
+
+    total_frames_written += (uint32_t)got;
     frames_needed -= (int)got;
   }
 
+  SDL_SetAtomicU32(&ctx->stream_written_samples, total_frames_written);
   SDL_UnlockMutex(ctx->mod_mutex);
 }
 
@@ -219,7 +173,7 @@ sndContext *sndCreateContext(const sndAudioSpec *spec) {
   SDL_AudioSpec sdlSpec = {
       .channels = 2, // NOTE: for now only stereo supported
       .freq = spec->sample_rate,
-      .format = SDL_AUDIO_S16,
+      .format = SDL_AUDIO_F32,
   };
 
   sndContext *ctx = calloc(1, sizeof(sndContext));
@@ -359,6 +313,13 @@ bool sndModuleLoadMemory(sndContext *ctx, const uint8_t *module, size_t size) {
   SDL_UnlockMutex(ctx->mod_mutex);
 
   return success;
+}
+
+int32_t sndModuleGetChannelCount(sndContext *ctx) {
+  if (ctx == NULL)
+    return false;
+
+  return ctx->mod_channels;
 }
 
 float sndPlaybackGetClock(sndContext *ctx) {
