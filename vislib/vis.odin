@@ -1,6 +1,8 @@
 package vislib
 
 import snd "../sndlib"
+import "core:fmt"
+import "core:math"
 import "core:strings"
 import rl "vendor:raylib"
 
@@ -44,7 +46,7 @@ Update :: proc(state: VisState, events: []snd.TickEvent) {
 
 	for ch, ch_idx in last_event.channels[:last_event.channel_count] {
 		state.channel_notes[ch_idx].note = f32(ch.note) + f32(ch.pitchbend) / 100.
-		state.channel_notes[ch_idx].alpha = f32(ch.volume) / 64.
+		state.channel_notes[ch_idx].alpha = math.log2((f32(ch.volume) / 64.) + 1)
 	}
 }
 
@@ -73,15 +75,16 @@ Draw :: proc(state: VisState) {
 		return
 	}
 
-	segment_width := i32(rl.GetRenderWidth() / i32(len(state.channel_notes)))
-	segment_height := i32(rl.GetRenderHeight())
+	segment_width := f32(rl.GetRenderWidth()) / f32(len(state.channel_notes))
+	segment_height := f32(rl.GetRenderHeight())
+	fmt.printf("%.2f\t%.2f\n", segment_width, segment_height)
 
 	for ch_note, ch_index in state.channel_notes {
 		rl.DrawRectangle(
-			segment_width * i32(ch_index),
+			i32(segment_width * f32(ch_index)),
 			0,
-			segment_width,
-			segment_height,
+			i32(segment_width),
+			i32(segment_height),
 			rl.ColorFromHSV(
 				360. * (f32(ch_index) / f32(len(state.channel_notes))),
 				1. - ch_note.alpha,
@@ -96,9 +99,9 @@ Draw :: proc(state: VisState) {
 		note_text_color := rl.Color{0, 0, 0, u8(ch_note.alpha * 255.)}
 
 		rl.DrawRectangle(
-			segment_width * i32(ch_index),
+			i32(segment_width * f32(ch_index)),
 			i32((ch_note.note / 120.) * f32(segment_height)),
-			segment_width,
+			i32(segment_width),
 			10,
 			note_text_color,
 		)
@@ -121,7 +124,7 @@ Draw :: proc(state: VisState) {
 
 		note_text_position :=
 			rl.Vector2{f32(segment_width), f32(segment_height)} / 2. +
-			rl.Vector2{f32(segment_width * i32(ch_index)), 0}
+			rl.Vector2{segment_width * f32(ch_index), 0}
 
 		rl.DrawTextPro(
 			state.note_font,
