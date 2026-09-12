@@ -6,4 +6,4 @@ cd sndlib
 ./build.sh
 cd ..
 
-odin build .
+odin build -debug -sanitize=address .
